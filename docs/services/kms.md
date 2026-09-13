@@ -60,9 +60,10 @@ Symmetric keys keep the emulator's internal ciphertext format, described below, 
 ## Symmetric Ciphertext Envelope
 
 `Encrypt`, `Decrypt`, `ReEncrypt` and `GenerateDataKey` protect `SYMMETRIC_DEFAULT` plaintext with
-real AES-256-GCM, using a per-key data-encryption key ("backing key") generated when the key is
-created and never exposed by any API. The blob is opaque bytes, base64-encoded in JSON exactly
-like real AWS KMS, but internally it is a versioned envelope:
+real AES-256-GCM, using a per-key data-encryption key ("backing key") that is generated when the
+key is created, or is the material imported into an `Origin=EXTERNAL` key, and is never exposed by
+any API. The blob is opaque bytes, base64-encoded in JSON exactly like real AWS KMS, but
+internally it is a versioned envelope:
 
 ```
 offset      size  field
@@ -129,6 +130,11 @@ future and no more than 365 days out. Once `ValidTo` passes, the material is dro
 returns to `PendingImport`, as does `DeleteImportedKeyMaterial`. Expiry is evaluated when the key
 is next read rather than on a timer, which is not observable through the API. Deleting the
 material of a key that is already in `PendingDeletion` leaves that state in place.
+
+A `SYMMETRIC_DEFAULT` key with `Origin=EXTERNAL` encrypts under the imported material itself: it
+is the backing key named in the ciphertext envelope described above, and no other material is
+ever generated for the key. Deleting or expiring the material removes that backing key, so
+ciphertext produced under it decrypts again only once the same material has been re-imported.
 
 A key in `PendingImport` rejects cryptographic operations, `EnableKey` and `DisableKey` with
 `KMSInvalidStateException`. `CancelKeyDeletion` on a key whose material was never imported, or was

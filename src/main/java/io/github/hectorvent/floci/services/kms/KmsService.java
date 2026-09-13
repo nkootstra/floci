@@ -326,6 +326,12 @@ public class KmsService implements ResourceProvider {
         if (KmsKeySpec.SYMMETRIC_DEFAULT != key.getKeySpec() || KmsKeyUsage.ENCRYPT_DECRYPT != key.getKeyUsage()) {
             return key;
         }
+        // An EXTERNAL key is backed only by what its owner imports (see importKeyMaterial).
+        // Minting random material here would let it encrypt under a key that was never imported
+        // and would keep that key usable after the imported material is deleted or expires.
+        if (EXTERNAL_ORIGIN.equals(key.getOrigin())) {
+            return key;
+        }
         if (hasBackingKeyMaterial(key)) {
             return key;
         }
@@ -901,6 +907,9 @@ public class KmsService implements ResourceProvider {
         requireSameMaterialAsFirstImport(key, keyMaterialId);
 
         key.setPrivateKeyEncoded(Base64.getEncoder().encodeToString(material));
+        if (KmsKeySpec.SYMMETRIC_DEFAULT == key.getKeySpec()) {
+            installImportedBackingKey(key, keyMaterialId, material);
+        }
         key.setKeyMaterialId(keyMaterialId);
         key.setExpirationModel(effectiveExpirationModel);
         key.setValidTo(KEY_MATERIAL_EXPIRES.equals(effectiveExpirationModel) ? validTo : 0L);
@@ -912,6 +921,18 @@ public class KmsService implements ResourceProvider {
         LOG.infov("Imported key material into KMS key {0} in {1} ({2})",
                 key.getKeyId(), region, effectiveExpirationModel);
         return key;
+    }
+
+    /**
+     * Makes the imported material the backing key of the ciphertext envelope. Its id is the
+     * {@code keyMaterialId}, which is derived from the material itself, so re-importing the same
+     * material after a delete or expiry reinstates the id that earlier ciphertext names.
+     */
+    private static void installImportedBackingKey(KmsKey key, String keyMaterialId, byte[] material) {
+        Map<String, String> backingKeys = new HashMap<>();
+        backingKeys.put(keyMaterialId, Base64.getEncoder().encodeToString(material));
+        key.setBackingKeys(backingKeys);
+        key.setCurrentBackingKeyId(keyMaterialId);
     }
 
     /**
@@ -954,6 +975,8 @@ public class KmsService implements ResourceProvider {
      */
     private static void clearImportedKeyMaterial(KmsKey key) {
         key.setPrivateKeyEncoded(null);
+        key.setBackingKeys(new HashMap<>());
+        key.setCurrentBackingKeyId(null);
         key.setExpirationModel(null);
         key.setValidTo(0);
         key.setImportParameters(null);
@@ -1329,6 +1352,9 @@ public class KmsService implements ResourceProvider {
         if (isEnvelopeV3(ciphertext)) {
             EnvelopeV3 envelope = parseEnvelopeV3(ciphertext);
             KmsKey key = resolveEnvelopeKey(envelope.keyId(), region);
+            // A key whose imported material was deleted or expired no longer holds the backing
+            // key this blob names; answer with the key's state, as AWS does, not "invalid ciphertext".
+            requireImportedKeyMaterial(key, "Decrypt");
             byte[] plaintext = decryptEnvelopeV3(envelope, key, encryptionContext);
 
             if (requestKeyId != null && !requestKeyId.isBlank()) {

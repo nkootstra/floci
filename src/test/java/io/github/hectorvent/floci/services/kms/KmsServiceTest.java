@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Test;
 
 import javax.crypto.Cipher;
 import javax.crypto.Mac;
+import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.OAEPParameterSpec;
 import javax.crypto.spec.PSource;
 import javax.crypto.spec.SecretKeySpec;
@@ -2628,6 +2629,66 @@ class KmsServiceTest {
             AwsException ex = assertThrows(AwsException.class, () ->
                     kmsService.getParametersForImport(keyId, "RSA_AES_KEY_WRAP_SHA_256", "RSA_2048", REGION));
             assertEquals("UnsupportedOperationException", ex.getErrorCode());
+        }
+
+        @Test
+        void aSymmetricKeyEncryptsWithTheMaterialThatWasImported() throws Exception {
+            KmsKey key = externalSymmetricKey();
+            byte[] rawMaterial = material(32, (byte) 42);
+            byte[] plaintext = "bring-your-own-key".getBytes(StandardCharsets.UTF_8);
+            importInto(key, rawMaterial, OAEP_SHA_256);
+
+            byte[] envelope = kmsService.encrypt(key.getKeyId(), plaintext, REGION);
+
+            // Open the documented KMS3 envelope with nothing but the imported material: the header
+            // up to and including the 12-byte IV is the AAD (an empty EncryptionContext adds none)
+            // and the 16-byte GCM tag trails the ciphertext.
+            int ivEnd = envelope.length - plaintext.length - 16;
+            byte[] headerAndIv = Arrays.copyOfRange(envelope, 0, ivEnd);
+            byte[] iv = Arrays.copyOfRange(envelope, ivEnd - 12, ivEnd);
+            Cipher aesGcm = Cipher.getInstance("AES/GCM/NoPadding");
+            aesGcm.init(Cipher.DECRYPT_MODE, new SecretKeySpec(rawMaterial, "AES"), new GCMParameterSpec(128, iv));
+            aesGcm.updateAAD(headerAndIv);
+            assertArrayEquals(plaintext, aesGcm.doFinal(Arrays.copyOfRange(envelope, ivEnd, envelope.length)));
+        }
+
+        @Test
+        void deletingImportedMaterialLeavesNothingThatCanOpenItsCiphertext() throws Exception {
+            KmsKey key = externalSymmetricKey();
+            importInto(key, material(32, (byte) 42), OAEP_SHA_256);
+            byte[] ciphertext = kmsService.encrypt(key.getKeyId(), "bring-your-own-key".getBytes(StandardCharsets.UTF_8), REGION);
+
+            kmsService.deleteImportedKeyMaterial(key.getKeyId(), REGION);
+
+            AwsException ex = assertThrows(AwsException.class, () -> kmsService.decrypt(ciphertext, REGION));
+            assertEquals("InvalidCiphertextException", ex.getErrorCode());
+        }
+
+        @Test
+        void decryptingUnderAKeyWhoseMaterialWasDeletedReportsPendingImport() throws Exception {
+            KmsKey key = externalSymmetricKey();
+            importInto(key, material(32, (byte) 42), OAEP_SHA_256);
+            byte[] ciphertext = kmsService.encrypt(key.getKeyId(), "bring-your-own-key".getBytes(StandardCharsets.UTF_8), REGION);
+
+            kmsService.deleteImportedKeyMaterial(key.getKeyId(), REGION);
+
+            AwsException ex = assertThrows(AwsException.class, () ->
+                    kmsService.decryptAndResolveKey(ciphertext, Map.of(), REGION, null));
+            assertEquals("KMSInvalidStateException", ex.getErrorCode());
+        }
+
+        @Test
+        void reimportingTheSameMaterialOpensCiphertextMadeBeforeTheDeletion() throws Exception {
+            KmsKey key = externalSymmetricKey();
+            byte[] rawMaterial = material(32, (byte) 42);
+            byte[] plaintext = "bring-your-own-key".getBytes(StandardCharsets.UTF_8);
+            importInto(key, rawMaterial, OAEP_SHA_256);
+            byte[] ciphertext = kmsService.encrypt(key.getKeyId(), plaintext, REGION);
+            kmsService.deleteImportedKeyMaterial(key.getKeyId(), REGION);
+
+            importInto(key, rawMaterial, OAEP_SHA_256);
+
+            assertArrayEquals(plaintext, kmsService.decrypt(ciphertext, REGION));
         }
     }
 
