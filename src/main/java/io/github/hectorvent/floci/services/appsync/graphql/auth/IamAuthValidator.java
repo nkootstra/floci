@@ -50,6 +50,7 @@ public class IamAuthValidator {
     private static final long MAX_CLOCK_SKEW_SECONDS = 300;
     private static final String LEGACY_ACCESS_KEY_ID = "test";
     private static final String LEGACY_SECRET_KEY = "test";
+    private static final String SECURITY_TOKEN = "X-Amz-Security-Token";
 
     private final AccountResolver accountResolver;
     private final IamService iamService;
@@ -122,6 +123,7 @@ public class IamAuthValidator {
             LOG.debugv("AppSync SigV4 request references unregistered access key={0}", sanitizeForLog(accessKeyId));
             throw AppSyncAuth.unauthorized();
         }
+        checkSessionToken(accessKeyId, info.requestHeaders());
         try {
             String canonicalUri = "/v1/apis/" + apiId + "/graphql";
             String payloadHash = sha256Hex(info.rawBody().getBytes(StandardCharsets.UTF_8));
@@ -158,14 +160,53 @@ public class IamAuthValidator {
         return iamService.findSecretKey(accessKeyId).orElse(null);
     }
 
+    /**
+     * Rejects a temporary ({@code ASIA...}) credential that does not present the session token
+     * Floci issued with it. Mirrors {@code ExecuteApiSigV4Authorizer.checkSessionToken}: a matching
+     * secret alone is not the whole credential, since AWS requires the session token on every
+     * request made with temporary credentials to confirm it is live and genuinely STS-issued.
+     *
+     * <p>The token is compared against the value recorded at mint time, not merely required to be
+     * present, so a fabricated token is rejected along with a missing one. A session recorded
+     * before Floci tracked tokens has no issued value to compare against ({@code findSessionToken}
+     * is empty there), so presence is all that can be demanded of it: rejecting that case would
+     * lock out an otherwise valid credential.
+     *
+     * <p>The token does not need to ride in {@code SignedHeaders}: comparing it against the issued
+     * value binds it regardless of where it rode, the same way the execute-api authorizer does.
+     */
+    private void checkSessionToken(String accessKeyId, Map<String, String> requestHeaders) {
+        if (!IamService.isTemporaryAccessKey(accessKeyId)) {
+            return;
+        }
+        String presented = header(requestHeaders, SECURITY_TOKEN);
+        if (isBlank(presented)) {
+            LOG.debugv("AppSync SigV4 request uses temporary credential accessKey={0} with no {1}",
+                    sanitizeForLog(accessKeyId), SECURITY_TOKEN);
+            throw AppSyncAuth.unauthorized();
+        }
+        String issued = iamService.findSessionToken(accessKeyId).orElse(null);
+        if (issued == null) {
+            return;
+        }
+        if (!MessageDigest.isEqual(issued.getBytes(StandardCharsets.UTF_8),
+                presented.getBytes(StandardCharsets.UTF_8))) {
+            LOG.debugv("AppSync SigV4 request presents a session token that does not match the one"
+                    + " issued for accessKey={0}", sanitizeForLog(accessKeyId));
+            throw AppSyncAuth.unauthorized();
+        }
+    }
+
     private record SignedRequest(String credential, String signedHeaders, String signature, String amzDate) {}
 
     /**
      * {@code X-Amz-Date} is a real HTTP header on a header-signed request, never a field inside the
      * {@code Authorization} value itself (that only ever carries {@code Credential}/
      * {@code SignedHeaders}/{@code Signature}), so it is read from {@code requestHeaders} - the same
-     * source {@code ExecuteApiSigV4Authorizer} reads it from - with the plain {@code Date} header as
-     * fallback for a client that only sets that one.
+     * source {@code ExecuteApiSigV4Authorizer} reads it from. There is no fallback to the plain
+     * {@code Date} header: unlike {@code X-Amz-Date}, it is RFC 1123-formatted, which {@link
+     * #AMZ_DATE} can never parse, so a request that only sets {@code Date} is rejected below
+     * regardless.
      */
     private static SignedRequest headerSignedRequest(String authorization, Map<String, String> requestHeaders) {
         if (authorization == null) {
@@ -186,9 +227,6 @@ public class IamAuthValidator {
         String signedHeaders = parameters.get("SignedHeaders");
         String signature = parameters.get("Signature");
         String amzDate = header(requestHeaders, "X-Amz-Date");
-        if (isBlank(amzDate)) {
-            amzDate = header(requestHeaders, "Date");
-        }
         if (isBlank(credential) || isBlank(signedHeaders) || isBlank(signature) || isBlank(amzDate)) {
             return null;
         }

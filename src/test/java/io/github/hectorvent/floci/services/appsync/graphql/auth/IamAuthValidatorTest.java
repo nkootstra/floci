@@ -191,6 +191,56 @@ class IamAuthValidatorTest {
     }
 
     @Test
+    void temporaryCredentialSignedButNoSessionTokenIs401() throws Exception {
+        when(iamService.findSecretKey("ASIANOTOKEN")).thenReturn(Optional.of("session-secret"));
+        Map<String, String> signed = AppSyncRequestSigner.signedHeaders(
+                "api-1", HOST, BODY, "ASIANOTOKEN", "session-secret", REGION, Instant.now());
+
+        AppSyncTransportException ex = assertThrows(AppSyncTransportException.class,
+                () -> validator.validateRequest(authorization(signed), "api-1", infoWith(signed)));
+        assertEquals(401, ex.getHttpStatus());
+    }
+
+    @Test
+    void temporaryCredentialWithMismatchedSessionTokenIs401() throws Exception {
+        when(iamService.findSecretKey("ASIAFORGED")).thenReturn(Optional.of("session-secret"));
+        when(iamService.findSessionToken("ASIAFORGED")).thenReturn(Optional.of("issued-token"));
+        Map<String, String> signed = signedWithSessionToken("ASIAFORGED", "session-secret", "forged-token");
+
+        AppSyncTransportException ex = assertThrows(AppSyncTransportException.class,
+                () -> validator.validateRequest(authorization(signed), "api-1", infoWith(signed)));
+        assertEquals(401, ex.getHttpStatus());
+    }
+
+    @Test
+    void temporaryCredentialWithIssuedSessionTokenIsAllowed() throws Exception {
+        when(iamService.findSecretKey("ASIALIVE")).thenReturn(Optional.of("session-secret"));
+        when(iamService.findSessionToken("ASIALIVE")).thenReturn(Optional.of("issued-token"));
+        when(iamService.resolveCallerArn("ASIALIVE")).thenReturn(
+                Optional.of("arn:aws:sts::000000000000:assumed-role/app/floci-session"));
+        Map<String, String> signed = signedWithSessionToken("ASIALIVE", "session-secret", "issued-token");
+
+        Map<String, Object> identity = validator.validateRequest(
+                authorization(signed), "api-1", infoWith(signed));
+
+        assertEquals("ASIALIVE", identity.get("user"));
+        assertEquals("floci-session", identity.get("username"));
+    }
+
+    /**
+     * Presents the session token the way an SDK does: as a header outside {@code SignedHeaders}.
+     * Nothing binds it to the signature, which is the point of comparing it against the issued
+     * value instead.
+     */
+    private static Map<String, String> signedWithSessionToken(String accessKeyId, String secretKey, String token)
+            throws Exception {
+        Map<String, String> signed = new java.util.LinkedHashMap<>(AppSyncRequestSigner.signedHeaders(
+                "api-1", HOST, BODY, accessKeyId, secretKey, REGION, Instant.now()));
+        signed.put("X-Amz-Security-Token", token);
+        return signed;
+    }
+
+    @Test
     void fieldArnDenyDetected() {
         when(iamService.resolveCallerContext("AKIAGOOD")).thenReturn(CallerContext.of(List.of(FIELD_DENY)));
         String fieldArn = IamAuthValidator.fieldArn("us-east-1", "000000000000", "api-1", "Query", "secret");
