@@ -2,14 +2,21 @@ package io.github.hectorvent.floci.services.ecs;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.ecs.container.HostVolumePolicy;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -18,6 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -34,6 +42,7 @@ class EcsJsonHandlerVolumesTest {
 
     private EcsService service;
     private ObjectMapper objectMapper;
+    private EmulatorConfig config;
     private EcsJsonHandler handler;
 
     @BeforeEach
@@ -51,11 +60,40 @@ class EcsJsonHandlerVolumesTest {
                     return td;
                 });
 
-        handler = new EcsJsonHandler(service, objectMapper);
+        // Deep-stubbed: unstubbed leaf methods return Optional.empty()/false, the same
+        // fail-closed defaults as production, so host-volume-roots is empty and
+        // allow-unsafe-host-volumes is false unless a test stubs otherwise. That means any
+        // test registering a host-volume sourcePath must explicitly opt in (a root or the
+        // unsafe flag) or expect the default rejection.
+        config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        handler = new EcsJsonHandler(service, objectMapper, new HostVolumePolicy(config));
+    }
+
+    private static String registerRequestWithHostVolume(String sourcePath) {
+        return """
+                {
+                  "family": "host-volume-family",
+                  "containerDefinitions": [
+                    {
+                      "name": "app",
+                      "image": "alpine:latest",
+                      "mountPoints": [
+                        {"sourceVolume": "vol", "containerPath": "/app/data", "readOnly": false}
+                      ]
+                    }
+                  ],
+                  "volumes": [
+                    {"name": "vol", "host": {"sourcePath": "%s"}}
+                  ]
+                }
+                """.formatted(sourcePath.replace("\\", "\\\\"));
     }
 
     @Test
     void registerTaskDefinitionRoundTripsVolumesAndMountPoints() throws Exception {
+        // This test is about JSON round-trip fidelity, not host-volume safety, so opt out of
+        // the fail-closed default explicitly.
+        when(config.services().ecs().allowUnsafeHostVolumes()).thenReturn(true);
         String requestJson = """
                 {
                   "family": "volumes-family",
@@ -245,5 +283,145 @@ class EcsJsonHandlerVolumesTest {
         assertEquals("/dps", efs.path("rootDirectory").asText());
         assertTrue(efs.path("authorizationConfig").path("accessPointId").isMissingNode(),
                 "accessPointId should not be set");
+    }
+
+    // ── Host-volume safety ──────────────────────────────────────────────────
+
+    @Test
+    void registerTaskDefinitionRejectsRelativeHostSourcePath() throws Exception {
+        JsonNode request = objectMapper.readTree(registerRequestWithHostVolume("relative/path"));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("RegisterTaskDefinition", request, "us-east-1"));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    @Test
+    void registerTaskDefinitionRejectsTraversalHostSourcePath() throws Exception {
+        JsonNode request = objectMapper.readTree(registerRequestWithHostVolume("/host/abs/../../etc"));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("RegisterTaskDefinition", request, "us-east-1"));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    @Test
+    void registerTaskDefinitionRejectsBareRootHostSourcePath() throws Exception {
+        JsonNode request = objectMapper.readTree(registerRequestWithHostVolume("/"));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("RegisterTaskDefinition", request, "us-east-1"));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    @Test
+    void registerTaskDefinitionRejectsDockerSocketHostVolume() throws Exception {
+        // Allow any host path so a rejection here can only come from the Docker-socket check
+        // itself, not the fail-closed default (proving the socket-specific rule fires).
+        when(config.services().ecs().allowUnsafeHostVolumes()).thenReturn(true);
+
+        JsonNode varRun = objectMapper.readTree(registerRequestWithHostVolume("/var/run/docker.sock"));
+        AwsException varRunEx = assertThrows(AwsException.class,
+                () -> handler.handle("RegisterTaskDefinition", varRun, "us-east-1"));
+        assertEquals("InvalidParameterException", varRunEx.getErrorCode());
+
+        JsonNode run = objectMapper.readTree(registerRequestWithHostVolume("/run/docker.sock"));
+        AwsException runEx = assertThrows(AwsException.class,
+                () -> handler.handle("RegisterTaskDefinition", run, "us-east-1"));
+        assertEquals("InvalidParameterException", runEx.getErrorCode());
+    }
+
+    @Test
+    void registerTaskDefinitionRejectsDockerSocketAncestorDirectories() throws Exception {
+        // Mounting a directory that CONTAINS the socket (/var/run, /run) exposes docker.sock
+        // just as directly as naming the socket file outright, and must be blocked even when
+        // allow-unsafe-host-volumes is true.
+        when(config.services().ecs().allowUnsafeHostVolumes()).thenReturn(true);
+
+        JsonNode varRun = objectMapper.readTree(registerRequestWithHostVolume("/var/run"));
+        AwsException varRunEx = assertThrows(AwsException.class,
+                () -> handler.handle("RegisterTaskDefinition", varRun, "us-east-1"));
+        assertEquals("InvalidParameterException", varRunEx.getErrorCode());
+
+        JsonNode run = objectMapper.readTree(registerRequestWithHostVolume("/run"));
+        AwsException runEx = assertThrows(AwsException.class,
+                () -> handler.handle("RegisterTaskDefinition", run, "us-east-1"));
+        assertEquals("InvalidParameterException", runEx.getErrorCode());
+    }
+
+    @Test
+    void registerTaskDefinitionRejectsHostSourcePathByDefault() throws Exception {
+        // With host-volume-roots empty and allow-unsafe-host-volumes false (the shipped
+        // defaults, unstubbed here), any host sourcePath is rejected fail-closed and the
+        // message names both config keys so an operator knows how to opt in.
+        JsonNode request = objectMapper.readTree(registerRequestWithHostVolume("/some/data"));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("RegisterTaskDefinition", request, "us-east-1"));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+        assertTrue(ex.getMessage().contains("floci.services.ecs.host-volume-roots"),
+                "message must name the roots config key: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("FLOCI_SERVICES_ECS_HOST_VOLUME_ROOTS"),
+                "message must name the roots env var: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("floci.services.ecs.allow-unsafe-host-volumes"),
+                "message must name the unsafe-flag config key: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("FLOCI_SERVICES_ECS_ALLOW_UNSAFE_HOST_VOLUMES"),
+                "message must name the unsafe-flag env var: " + ex.getMessage());
+    }
+
+    @Test
+    void registerTaskDefinitionRejectsHostSourcePathOutsideConfiguredRoots() throws Exception {
+        when(config.services().ecs().hostVolumeRoots()).thenReturn(Optional.of(List.of("/approved")));
+        JsonNode request = objectMapper.readTree(registerRequestWithHostVolume("/not-approved/data"));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("RegisterTaskDefinition", request, "us-east-1"));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    @Test
+    void registerTaskDefinitionAllowsHostSourcePathInsideConfiguredRoots() throws Exception {
+        when(config.services().ecs().hostVolumeRoots()).thenReturn(Optional.of(List.of("/approved")));
+        JsonNode request = objectMapper.readTree(registerRequestWithHostVolume("/approved/sub/data"));
+
+        Response response = handler.handle("RegisterTaskDefinition", request, "us-east-1");
+        JsonNode td = objectMapper.valueToTree(response.getEntity()).path("taskDefinition");
+        assertEquals("/approved/sub/data",
+                td.path("volumes").get(0).path("host").path("sourcePath").asText());
+    }
+
+    @Test
+    void registerTaskDefinitionAllowUnsafeHostVolumesBypassesRootCheckButNotDockerSocket() throws Exception {
+        when(config.services().ecs().hostVolumeRoots()).thenReturn(Optional.of(List.of("/approved")));
+        when(config.services().ecs().allowUnsafeHostVolumes()).thenReturn(true);
+
+        JsonNode outsideRoot = objectMapper.readTree(registerRequestWithHostVolume("/anywhere/else"));
+        Response response = handler.handle("RegisterTaskDefinition", outsideRoot, "us-east-1");
+        JsonNode td = objectMapper.valueToTree(response.getEntity()).path("taskDefinition");
+        assertEquals("/anywhere/else",
+                td.path("volumes").get(0).path("host").path("sourcePath").asText());
+
+        JsonNode socket = objectMapper.readTree(registerRequestWithHostVolume("/var/run/docker.sock"));
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("RegisterTaskDefinition", socket, "us-east-1"));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    @Test
+    void registerTaskDefinitionRejectsSymlinkEscapeOutsideConfiguredRoot(@TempDir Path tempDir) throws IOException {
+        Path approvedRoot = tempDir.resolve("approved");
+        Path outsideTarget = tempDir.resolve("outside");
+        Files.createDirectories(approvedRoot);
+        Files.createDirectories(outsideTarget);
+        Path escapeLink = approvedRoot.resolve("escape");
+        Files.createSymbolicLink(escapeLink, outsideTarget);
+
+        when(config.services().ecs().hostVolumeRoots())
+                .thenReturn(Optional.of(List.of(approvedRoot.toString())));
+        JsonNode request = objectMapper.readTree(registerRequestWithHostVolume(escapeLink.toString()));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("RegisterTaskDefinition", request, "us-east-1"));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
     }
 }
