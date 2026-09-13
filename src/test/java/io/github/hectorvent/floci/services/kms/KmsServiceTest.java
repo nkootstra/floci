@@ -32,12 +32,18 @@ import java.security.spec.PSSParameterSpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -2747,6 +2753,51 @@ class KmsServiceTest {
             KmsKey healed = keyStore.get(REGION + "::" + key.getKeyId()).orElseThrow();
             assertNotNull(healed.getCurrentBackingKeyId());
             assertFalse(healed.getBackingKeys().isEmpty());
+        }
+
+        @Test
+        void concurrentFirstUsesOfALegacyKeyMintExactlyOneBackingKey() throws Exception {
+            KmsKey key = kmsService.createKey(null, REGION);
+            KmsKey stored = keyStore.get(REGION + "::" + key.getKeyId()).orElseThrow();
+            // Simulate a key persisted before this fix: no backing key material on disk.
+            stored.setBackingKeys(new HashMap<>());
+            stored.setCurrentBackingKeyId(null);
+            keyStore.put(REGION + "::" + key.getKeyId(), stored);
+
+            int threadCount = 12;
+            byte[] plaintext = "concurrent-legacy-plaintext".getBytes(StandardCharsets.UTF_8);
+            CountDownLatch startGate = new CountDownLatch(1);
+            List<Future<byte[]>> futures = new ArrayList<>();
+
+            try (ExecutorService executor = Executors.newFixedThreadPool(threadCount)) {
+                for (int i = 0; i < threadCount; i++) {
+                    futures.add(executor.submit(() -> {
+                        startGate.await();
+                        return kmsService.encrypt(key.getKeyId(), plaintext, REGION);
+                    }));
+                }
+                startGate.countDown();
+
+                List<byte[]> ciphertexts = new ArrayList<>();
+                for (Future<byte[]> future : futures) {
+                    ciphertexts.add(future.get(10, TimeUnit.SECONDS));
+                }
+
+                // Every thread must have healed onto the same backing key: exactly one backing key
+                // was minted for the whole race, never one per racing thread.
+                KmsKey healed = keyStore.get(REGION + "::" + key.getKeyId()).orElseThrow();
+                assertNotNull(healed.getCurrentBackingKeyId());
+                assertEquals(1, healed.getBackingKeys().size(),
+                        "concurrent first uses of a legacy key must mint exactly one backing key");
+                assertTrue(healed.getBackingKeys().containsKey(healed.getCurrentBackingKeyId()));
+
+                // Every ciphertext produced under the race, regardless of which thread produced it,
+                // must still decrypt: none of them can have been encrypted under a backing key that
+                // a losing keyStore.put then discarded.
+                for (byte[] ciphertext : ciphertexts) {
+                    assertArrayEquals(plaintext, kmsService.decrypt(ciphertext, REGION));
+                }
+            }
         }
 
         private static int indexOf(byte[] haystack, byte[] needle) {

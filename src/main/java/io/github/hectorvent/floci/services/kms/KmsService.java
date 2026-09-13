@@ -102,6 +102,9 @@ public class KmsService implements ResourceProvider {
     private final StorageBackend<String, KmsGrant> grantStore;
     private final RegionResolver regionResolver;
     private final SecureRandom secureRandom;
+    // Guards the check-generate-put sequence in ensureBackingKeyMaterial so two concurrent
+    // first uses of the same legacy key cannot each mint a different backing key.
+    private final Object backingKeyMaterialLock = new Object();
 
     @Inject
     public KmsService(StorageFactory storageFactory, RegionResolver regionResolver) {
@@ -305,18 +308,42 @@ public class KmsService implements ResourceProvider {
      * load (existing {@code @JsonIgnoreProperties(ignoreUnknown = true)} already tolerates the
      * missing field). Material is generated lazily on first use and persisted immediately,
      * mirroring how {@link #expireImportedKeyMaterialIfDue} self-heals imported-key state.
+     *
+     * <p>Double-checked: the cheap unsynchronized check below lets an already-healed key (the
+     * overwhelming majority of calls, once a key has been used once) return without taking the
+     * lock. Only a key that still needs healing pays for entering the {@code synchronized}
+     * block, where the key is re-read from {@code keyStore} and re-checked before generating,
+     * so that if two callers race to heal the same legacy key concurrently, only one backing key
+     * is ever minted and every caller ends up with (and returns) the same persisted instance.
+     * Without this, two concurrent first uses could each generate a different backing key and
+     * each {@code put} their own copy, leaving one of the two backing keys, and any ciphertext
+     * encrypted under it, unreachable from the persisted key.
+     *
+     * @return the key instance to use for this call: either {@code key} unchanged, or the
+     *     re-read, healed instance that was just persisted.
      */
-    private void ensureBackingKeyMaterial(KmsKey key, String region) {
+    private KmsKey ensureBackingKeyMaterial(KmsKey key, String region) {
         if (KmsKeySpec.SYMMETRIC_DEFAULT != key.getKeySpec() || KmsKeyUsage.ENCRYPT_DECRYPT != key.getKeyUsage()) {
-            return;
+            return key;
         }
-        if (key.getCurrentBackingKeyId() != null && key.getBackingKeys() != null
-                && key.getBackingKeys().containsKey(key.getCurrentBackingKeyId())) {
-            return;
+        if (hasBackingKeyMaterial(key)) {
+            return key;
         }
-        generateBackingKey(key);
-        keyStore.put(region + "::" + key.getKeyId(), key);
-        LOG.infov("Generated backing key material for legacy KMS key: {0} in {1}", key.getKeyId(), region);
+        synchronized (backingKeyMaterialLock) {
+            KmsKey current = keyStore.get(region + "::" + key.getKeyId()).orElse(key);
+            if (hasBackingKeyMaterial(current)) {
+                return current;
+            }
+            generateBackingKey(current);
+            keyStore.put(region + "::" + current.getKeyId(), current);
+            LOG.infov("Generated backing key material for legacy KMS key: {0} in {1}", current.getKeyId(), region);
+            return current;
+        }
+    }
+
+    private static boolean hasBackingKeyMaterial(KmsKey key) {
+        return key.getCurrentBackingKeyId() != null && key.getBackingKeys() != null
+                && key.getBackingKeys().containsKey(key.getCurrentBackingKeyId());
     }
 
     public KmsKey getPublicKey(String keyId, String region) {
@@ -2230,7 +2257,7 @@ public class KmsService implements ResourceProvider {
         KmsKey key = keyStore.get(region + "::" + id)
                 .orElseThrow(() -> new AwsException("NotFoundException", "Key not found: " + keyIdOrArn, 404));
         key = expireImportedKeyMaterialIfDue(key, region);
-        ensureBackingKeyMaterial(key, region);
+        key = ensureBackingKeyMaterial(key, region);
         return key;
     }
 
