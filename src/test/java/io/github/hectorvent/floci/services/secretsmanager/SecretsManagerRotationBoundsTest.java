@@ -50,7 +50,8 @@ class SecretsManagerRotationBoundsTest {
         SecretsManagerService svc = new SecretsManagerService(new InMemoryStorage<String, Secret>(), 30,
                 new RegionResolver(REGION, "000000000000"), mockLambda, new ObjectMapper());
 
-        int secretCount = 300;
+        // Well above the pool size on any host, so an unbounded executor would exceed the cap.
+        int secretCount = SecretsManagerService.ROTATION_EXECUTOR_POOL_SIZE + 300;
         for (int i = 0; i < secretCount; i++) {
             String name = "thread-bound-" + i;
             svc.createSecret(name, "v1", null, null, null, null, REGION);
